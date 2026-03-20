@@ -75,8 +75,9 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 // It is initialized once via antigravityTransportOnce to avoid leaking a new connection pool
 // (and the goroutines managing it) on every request.
 var (
-	antigravityTransport     *http.Transport
-	antigravityTransportOnce sync.Once
+	antigravityTransport           *http.Transport
+	antigravityTransportOnce       sync.Once
+	antigravityProxyTransportCache sync.Map // map[string]*http.Transport
 )
 
 func cloneTransportWithHTTP11(base *http.Transport) *http.Transport {
@@ -105,6 +106,18 @@ func initAntigravityTransport() {
 		base = &http.Transport{}
 	}
 	antigravityTransport = cloneTransportWithHTTP11(base)
+	antigravityTransport = tuneTransport(antigravityTransport)
+}
+
+// tuneTransport applies aggressive connection pooling limits suitable for CLI proxies (e.g. 20+ terminals).
+func tuneTransport(t *http.Transport) *http.Transport {
+	if t == nil {
+		return nil
+	}
+	t.MaxIdleConns = 1000
+	t.MaxIdleConnsPerHost = 100
+	t.IdleConnTimeout = 90 * time.Second
+	return t
 }
 
 // newAntigravityHTTPClient creates an HTTP client specifically for Antigravity,
@@ -122,7 +135,28 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 
 	// Preserve proxy settings from proxy-aware transports while forcing HTTP/1.1.
 	if transport, ok := client.Transport.(*http.Transport); ok {
-		client.Transport = cloneTransportWithHTTP11(transport)
+		// Use proxy URL to cache the cloned proxy transport
+		var proxyURL string
+		if auth != nil {
+			proxyURL = strings.TrimSpace(auth.ProxyURL)
+		}
+		if proxyURL == "" && cfg != nil {
+			proxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
+
+		if proxyURL != "" {
+			if cached, ok := antigravityProxyTransportCache.Load(proxyURL); ok {
+				client.Transport = cached.(*http.Transport)
+				return client
+			}
+
+			cloned := cloneTransportWithHTTP11(transport)
+			cloned = tuneTransport(cloned)
+			antigravityProxyTransportCache.Store(proxyURL, cloned)
+			client.Transport = cloned
+		} else {
+			client.Transport = cloneTransportWithHTTP11(transport)
+		}
 	}
 	return client
 }

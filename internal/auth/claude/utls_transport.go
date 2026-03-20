@@ -155,8 +155,21 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 // NewAnthropicHttpClient creates an HTTP client that bypasses TLS fingerprinting
 // for Anthropic domains by using utls with Chrome fingerprint.
 // It accepts optional SDK configuration for proxy settings.
+var utlsClientCache sync.Map // map[string]*http.Client
+
 func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
-	return &http.Client{
+	proxyURL := ""
+	if cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+
+	if cached, ok := utlsClientCache.Load(proxyURL); ok {
+		return cached.(*http.Client)
+	}
+
+	client := &http.Client{
 		Transport: newUtlsRoundTripper(cfg),
 	}
+	utlsClientCache.Store(proxyURL, client)
+	return client
 }

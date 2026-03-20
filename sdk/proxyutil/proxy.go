@@ -7,8 +7,15 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"golang.org/x/net/proxy"
+)
+
+var (
+	transportCache sync.Map // map[string]*http.Transport
+	dialerCache    sync.Map // map[string]proxy.Dialer
 )
 
 // Mode describes how a proxy setting should be interpreted.
@@ -68,29 +75,58 @@ func Parse(raw string) (Setting, error) {
 	}
 }
 
+// tuneTransport applies aggressive connection pooling limits suitable for CLI proxies (e.g. 20+ terminals).
+func tuneTransport(t *http.Transport) *http.Transport {
+	if t == nil {
+		return nil
+	}
+	t.MaxIdleConns = 1000
+	t.MaxIdleConnsPerHost = 100
+	t.IdleConnTimeout = 90 * time.Second
+	return t
+}
+
 // NewDirectTransport returns a transport that bypasses environment proxies.
 func NewDirectTransport() *http.Transport {
 	if transport, ok := http.DefaultTransport.(*http.Transport); ok && transport != nil {
 		clone := transport.Clone()
 		clone.Proxy = nil
-		return clone
+		return tuneTransport(clone)
 	}
-	return &http.Transport{Proxy: nil}
+	return tuneTransport(&http.Transport{Proxy: nil})
 }
 
 // BuildHTTPTransport constructs an HTTP transport for the provided proxy setting.
+// It caches transports by raw setting to prevent connection pool exhaustion.
 func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 	setting, errParse := Parse(raw)
 	if errParse != nil {
 		return nil, setting.Mode, errParse
 	}
 
-	switch setting.Mode {
-	case ModeInherit:
+	// For inherit mode, do not cache since the transport is nil.
+	if setting.Mode == ModeInherit {
 		return nil, setting.Mode, nil
+	}
+
+	// Check cache
+	if cached, ok := transportCache.Load(setting.Raw); ok {
+		return cached.(*http.Transport), setting.Mode, nil
+	}
+
+	var transport *http.Transport
+	switch setting.Mode {
 	case ModeDirect:
-		return NewDirectTransport(), setting.Mode, nil
+		transport = NewDirectTransport()
 	case ModeProxy:
+		// Clone DefaultTransport to inherit TLS config, timeouts, etc.
+		if t, ok := http.DefaultTransport.(*http.Transport); ok && t != nil {
+			transport = t.Clone()
+		} else {
+			transport = &http.Transport{}
+		}
+		transport = tuneTransport(transport)
+
 		if setting.URL.Scheme == "socks5" {
 			var proxyAuth *proxy.Auth
 			if setting.URL.User != nil {
@@ -102,38 +138,51 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 			if errSOCKS5 != nil {
 				return nil, setting.Mode, fmt.Errorf("create SOCKS5 dialer failed: %w", errSOCKS5)
 			}
-			return &http.Transport{
-				Proxy: nil,
-				DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
-					return dialer.Dial(network, addr)
-				},
-			}, setting.Mode, nil
+			transport.Proxy = nil
+			transport.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			}
+		} else {
+			transport.Proxy = http.ProxyURL(setting.URL)
 		}
-		return &http.Transport{Proxy: http.ProxyURL(setting.URL)}, setting.Mode, nil
-	default:
-		return nil, setting.Mode, nil
 	}
+
+	if transport != nil {
+		transportCache.Store(setting.Raw, transport)
+	}
+	return transport, setting.Mode, nil
 }
 
 // BuildDialer constructs a proxy dialer for settings that operate at the connection layer.
+// It caches dialers by raw setting.
 func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 	setting, errParse := Parse(raw)
 	if errParse != nil {
 		return nil, setting.Mode, errParse
 	}
 
-	switch setting.Mode {
-	case ModeInherit:
+	if setting.Mode == ModeInherit {
 		return nil, setting.Mode, nil
+	}
+
+	if cached, ok := dialerCache.Load(setting.Raw); ok {
+		return cached.(proxy.Dialer), setting.Mode, nil
+	}
+
+	var dialer proxy.Dialer
+	switch setting.Mode {
 	case ModeDirect:
-		return proxy.Direct, setting.Mode, nil
+		dialer = proxy.Direct
 	case ModeProxy:
-		dialer, errDialer := proxy.FromURL(setting.URL, proxy.Direct)
+		var errDialer error
+		dialer, errDialer = proxy.FromURL(setting.URL, proxy.Direct)
 		if errDialer != nil {
 			return nil, setting.Mode, fmt.Errorf("create proxy dialer failed: %w", errDialer)
 		}
-		return dialer, setting.Mode, nil
-	default:
-		return nil, setting.Mode, nil
 	}
+
+	if dialer != nil {
+		dialerCache.Store(setting.Raw, dialer)
+	}
+	return dialer, setting.Mode, nil
 }
